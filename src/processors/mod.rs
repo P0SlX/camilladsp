@@ -22,7 +22,7 @@ pub mod compressor;
 pub mod noisegate;
 pub mod race;
 
-pub trait Processor {
+pub trait Processor: Send {
     // Process a chunk containing several channels.
     fn process_chunk(&mut self, chunk: &mut AudioChunk) -> Res<()>;
 

@@ -1,5 +1,8 @@
 extern crate criterion;
-use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, SamplingMode, criterion_group, criterion_main};
+use std::hint::black_box;
+use std::time::{Duration, Instant};
+
 extern crate camillalib;
 
 use camillalib::ProcessingParameters;
@@ -81,6 +84,7 @@ fn build_pipeline(chunksize: usize, multithreaded: bool, with_conv: bool) -> Pip
     let extra_filters = if with_conv { CONV_LENGTHS.len() } else { 0 };
     let mut pre_filter_names = Vec::with_capacity(PRE_BIQUAD_PARAMS.len() + extra_filters);
     let mut post_filter_names = Vec::with_capacity(POST_BIQUAD_PARAMS.len() + extra_filters);
+
     for (index, (freq, q)) in PRE_BIQUAD_PARAMS.iter().enumerate() {
         let name = format!("pre_bq_{}", index + 1);
         filters.insert(name.clone(), build_biquad_filter(*freq, *q));
@@ -222,20 +226,44 @@ fn build_pipeline(chunksize: usize, multithreaded: bool, with_conv: bool) -> Pip
     Pipeline::from_config(conf, processing_params)
 }
 
-fn make_chunk(channels: usize, frames: usize) -> AudioChunk {
-    let mut waveforms = Vec::with_capacity(channels);
-    for channel in 0..channels {
-        let mut waveform = Vec::with_capacity(frames);
-        for frame in 0..frames {
-            let phase = (frame as f64 + channel as f64 * 13.0) * 0.013;
-            waveform.push(phase.sin() as camillalib::PrcFmt);
-        }
-        waveforms.push(waveform);
-    }
-    AudioChunk::new(waveforms, 0.0, 0.0, frames, frames)
+/// Pre-compute waveform data once for all benchmark iterations.
+fn make_waveforms(channels: usize, frames: usize) -> Vec<Vec<camillalib::PrcFmt>> {
+    (0..channels)
+        .map(|channel| {
+            (0..frames)
+                .map(|frame| {
+                    let phase = (frame as f64 + channel as f64 * 13.0) * 0.013;
+                    phase.sin() as camillalib::PrcFmt
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Construct a fresh `AudioChunk` by cloning pre-computed waveform data.
+fn clone_chunk(waveforms: &[Vec<camillalib::PrcFmt>]) -> AudioChunk {
+    let frames = waveforms[0].len();
+    AudioChunk::new(
+        waveforms.iter().map(|w| w.clone()).collect(),
+        0.0,
+        0.0,
+        frames,
+        frames,
+    )
 }
 
 fn bench_complete_pipeline(c: &mut Criterion) {
+    // Mirror the thread count the real engine would configure so the
+    // parallel-filters step is exercised at the same concurrency level.
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build()
+        .expect("failed to build dedicated rayon thread pool for pipeline benchmark");
+
     let variants = [
         ("biquad_single", false, false),
         ("biquad_multi", true, false),
@@ -243,19 +271,40 @@ fn bench_complete_pipeline(c: &mut Criterion) {
         ("biquad_conv_multi", true, true),
     ];
 
+    let waveforms = make_waveforms(4, CHUNK_SIZE);
+
     let mut group = c.benchmark_group("complete_pipeline_chunk");
+    group
+        .sampling_mode(SamplingMode::Flat)
+        .warm_up_time(Duration::from_secs(5))
+        .measurement_time(Duration::from_secs(20))
+        .sample_size(50);
+
     for (name, multithreaded, with_conv) in variants {
         let mut pipeline = build_pipeline(CHUNK_SIZE, multithreaded, with_conv);
+
+        pool.install(|| {
+            for _ in 0..200 {
+                black_box(pipeline.process_chunk(clone_chunk(&waveforms)));
+            }
+        });
+
         group.bench_with_input(BenchmarkId::new("variant", name), &name, |b, _| {
-            b.iter_batched(
-                || make_chunk(4, CHUNK_SIZE),
-                |chunk| {
-                    let _out = pipeline.process_chunk(chunk);
-                },
-                BatchSize::SmallInput,
-            )
+            b.iter_custom(|iters| {
+                let iters = iters as usize;
+                let chunks: Vec<AudioChunk> = (0..iters).map(|_| clone_chunk(&waveforms)).collect();
+
+                pool.install(|| {
+                    let start = Instant::now();
+                    for chunk in chunks {
+                        black_box(pipeline.process_chunk(chunk));
+                    }
+                    start.elapsed()
+                })
+            });
         });
     }
+
     group.finish();
 }
 
