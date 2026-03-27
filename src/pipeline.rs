@@ -147,6 +147,11 @@ impl FilterGroup {
         }
         Ok(())
     }
+
+    fn step_name(&self) -> String {
+        let filter_names: Vec<&str> = self.filters.iter().map(|f| f.name()).collect();
+        format!("Filter:{}/ch:{}", filter_names.join(","), self.channel)
+    }
 }
 
 pub struct ParallelFilters {
@@ -181,6 +186,10 @@ impl ParallelFilters {
             });
         Ok(())
     }
+
+    fn step_name(&self) -> String {
+        "ParallelFilters".to_string()
+    }
 }
 
 /// A Pipeline is made up of a series of PipelineSteps,
@@ -194,6 +203,9 @@ pub enum PipelineStep {
 
 pub struct Pipeline {
     steps: Vec<PipelineStep>,
+    /// Human-readable names parallel to `steps`, with "Volume" prepended for
+    /// the implicit master-volume step that is always executed first.
+    step_names: Vec<String>,
     volume: filters::basicfilters::Volume,
     secs_per_chunk: f32,
     processing_params: Arc<ProcessingParameters>,
@@ -308,8 +320,19 @@ impl Pipeline {
         if conf.devices.multithreaded() {
             steps = parallelize_filters(&mut steps, conf.devices.capture.channels());
         }
+        // Build step_names after parallelize_filters so names reflect the
+        // actual steps vector (parallel filter groups get a single entry).
+        let step_names: Vec<String> = std::iter::once("Volume".to_string())
+            .chain(steps.iter().map(|s| match s {
+                PipelineStep::MixerStep(m) => format!("Mixer:{}", m.name),
+                PipelineStep::FilterStep(f) => f.step_name(),
+                PipelineStep::ParallelFiltersStep(f) => f.step_name(),
+                PipelineStep::ProcessorStep(p) => format!("Processor:{}", p.name()),
+            }))
+            .collect();
         Pipeline {
             steps,
+            step_names,
             volume,
             secs_per_chunk,
             processing_params,
@@ -351,21 +374,54 @@ impl Pipeline {
 
     /// Process an AudioChunk by calling either a MixerStep or a FilterStep
     pub fn process_chunk(&mut self, mut chunk: AudioChunk) -> AudioChunk {
+        let profiling = self.processing_params.profiling_enabled();
         let start = Instant::now();
-        self.volume.process_chunk(&mut chunk);
-        for mut step in &mut self.steps {
-            match &mut step {
-                PipelineStep::MixerStep(mix) => {
-                    chunk = mix.process_chunk(chunk);
+        if profiling {
+            // Per-step timing path.
+            // step_names[0] == "Volume" (the implicit fader step run first).
+            // step_names[1..] are parallel to self.steps.
+            let mut step_times = vec![0.0f32; self.step_names.len()];
+            let t = Instant::now();
+            self.volume.process_chunk(&mut chunk);
+            step_times[0] = t.elapsed().as_secs_f32() * 1000.0;
+            for (idx, step) in self.steps.iter_mut().enumerate() {
+                let t = Instant::now();
+                match step {
+                    PipelineStep::MixerStep(mix) => {
+                        chunk = mix.process_chunk(chunk);
+                    }
+                    PipelineStep::FilterStep(flt) => {
+                        flt.process_chunk(&mut chunk).unwrap();
+                    }
+                    PipelineStep::ParallelFiltersStep(flt) => {
+                        flt.process_chunk(&mut chunk).unwrap();
+                    }
+                    PipelineStep::ProcessorStep(comp) => {
+                        comp.process_chunk(&mut chunk).unwrap();
+                    }
                 }
-                PipelineStep::FilterStep(flt) => {
-                    flt.process_chunk(&mut chunk).unwrap();
-                }
-                PipelineStep::ParallelFiltersStep(flt) => {
-                    flt.process_chunk(&mut chunk).unwrap();
-                }
-                PipelineStep::ProcessorStep(comp) => {
-                    comp.process_chunk(&mut chunk).unwrap();
+                step_times[idx + 1] = t.elapsed().as_secs_f32() * 1000.0;
+            }
+            let profile: Vec<(String, f32)> =
+                self.step_names.iter().cloned().zip(step_times).collect();
+            self.processing_params.update_pipeline_profile(profile);
+        } else {
+            // Fast path: single branch check, no allocations, no locks.
+            self.volume.process_chunk(&mut chunk);
+            for mut step in &mut self.steps {
+                match &mut step {
+                    PipelineStep::MixerStep(mix) => {
+                        chunk = mix.process_chunk(chunk);
+                    }
+                    PipelineStep::FilterStep(flt) => {
+                        flt.process_chunk(&mut chunk).unwrap();
+                    }
+                    PipelineStep::ParallelFiltersStep(flt) => {
+                        flt.process_chunk(&mut chunk).unwrap();
+                    }
+                    PipelineStep::ProcessorStep(comp) => {
+                        comp.process_chunk(&mut chunk).unwrap();
+                    }
                 }
             }
         }

@@ -154,6 +154,8 @@ enum WsCommand {
     GetAvailablePlaybackDevices(String),
     GetProcessingLoad,
     GetResamplerLoad,
+    SetProfilingEnabled(bool),
+    GetPipelineProfile,
     Exit,
     Stop,
     None,
@@ -456,6 +458,13 @@ enum WsReply {
     GetResamplerLoad {
         result: WsResult,
         value: f32,
+    },
+    SetProfilingEnabled {
+        result: WsResult,
+    },
+    GetPipelineProfile {
+        result: WsResult,
+        value: Vec<(String, f32)>,
     },
     Exit {
         result: WsResult,
@@ -1635,6 +1644,21 @@ fn handle_command(
             Some(WsReply::GetResamplerLoad {
                 result: WsResult::Ok,
                 value: load,
+            })
+        }
+        WsCommand::SetProfilingEnabled(enabled) => {
+            shared_data_inst
+                .processing_params
+                .set_profiling_enabled(enabled);
+            Some(WsReply::SetProfilingEnabled {
+                result: WsResult::Ok,
+            })
+        }
+        WsCommand::GetPipelineProfile => {
+            let profile = shared_data_inst.processing_params.get_pipeline_profile();
+            Some(WsReply::GetPipelineProfile {
+                result: WsResult::Ok,
+                value: profile,
             })
         }
         WsCommand::None => None,

@@ -221,6 +221,10 @@ pub struct ProcessingParameters {
     mute: [AtomicBool; Self::NUM_FADERS],
     processing_load: AtomicU32,
     resampler_load: AtomicU32,
+    // Per-step pipeline profiler. Flag is read lock-free on every chunk;
+    // profile data is written only when profiling is active.
+    profiling_enabled: AtomicBool,
+    pipeline_profile: RwLock<Vec<(String, f32)>>,
 }
 
 impl ProcessingParameters {
@@ -254,6 +258,8 @@ impl ProcessingParameters {
             ],
             processing_load: AtomicU32::new(0.0f32.to_bits()),
             resampler_load: AtomicU32::new(0.0f32.to_bits()),
+            profiling_enabled: AtomicBool::new(false),
+            pipeline_profile: RwLock::new(Vec::new()),
         }
     }
 
@@ -320,6 +326,31 @@ impl ProcessingParameters {
 
     pub fn resampler_load(&self) -> f32 {
         f32::from_bits(self.resampler_load.load(Ordering::Relaxed))
+    }
+
+    /// Returns true if per-step pipeline profiling is currently active.
+    /// Uses `Relaxed` ordering — this is a diagnostic hint, not a
+    /// synchronisation barrier.
+    pub fn profiling_enabled(&self) -> bool {
+        self.profiling_enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn set_profiling_enabled(&self, enabled: bool) {
+        self.profiling_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Called from the audio thread after each chunk when profiling is on.
+    /// Uses `try_write` so it never blocks: if a websocket reader holds the
+    /// lock we simply skip this update — the data will be fresh next chunk.
+    pub fn update_pipeline_profile(&self, profile: Vec<(String, f32)>) {
+        if let Some(mut guard) = self.pipeline_profile.try_write() {
+            *guard = profile;
+        }
+    }
+
+    /// Snapshot of the latest per-step timings, cloned for the caller.
+    pub fn get_pipeline_profile(&self) -> Vec<(String, f32)> {
+        self.pipeline_profile.read().clone()
     }
 }
 
