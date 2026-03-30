@@ -20,13 +20,18 @@ use num_complex::Complex;
 // NEON SIMD kernels for complex multiply/multiply-add on aarch64.
 // result.re = a.re*b.re - a.im*b.im, result.im = a.re*b.im + a.im*b.re
 //
-// Strategy: broadcast a.re and a.im, swap b's components, apply a sign mask
-// [-1, 1] to get the correct subtract/add pattern, then use FMA:
-//   result = a_re * b + a_im * b_swap_signed
+// Strategy: rotate b's components (vextq_f64/vrev64q_f32), flip the sign bit
+// of the b.im lane via integer XOR to get [-b.im, b.re], then use FMA.
+//   f64: lane-indexed FMA — no explicit vdup broadcast needed:
+//        b * a[0] + b_sw * a[1]  →  [b.re*a.re - b.im*a.im, b.im*a.re + b.re*a.im]
+//   f32: vtrn-broadcast FMA: a_re * b + a_im * b_sw
 //
-// For multiply_add (accumulate), the accumulator is folded into the first FMA
-// to eliminate a separate ADD instruction:
-//   result = fma(fma(acc, a_re, b), a_im, b_swap_signed)
+// For multiply_add (accumulate), the accumulator is folded into the first FMA:
+//   f64: fma_laneq<1>(fma_laneq<0>(acc, b, a), b_sw, a)
+//        vfmaq_laneq_f64(a, b, v) = a + b*v[N], so the argument order is (acc, b, a);
+//        this differs from the f32 form vfmaq_f32(a, b, c) = a + b*c,
+//        which uses (acc, a_re, b).
+//   f32: fma(fma(acc, a_re, b), a_im, b_sw)
 //
 // 4x-register unrolled main loop + 1x cleanup + scalar tail (f32 only).
 
@@ -47,22 +52,20 @@ pub(super) unsafe fn multiply_elements_neon(
     let a_ptr = slice_a.as_ptr() as *const f64;
     let b_ptr = slice_b.as_ptr() as *const f64;
 
-    // Sign mask for complex multiply: negate real part of cross-product.
-    // [-1.0, 1.0]: after swapping b to [b.im, b.re], multiplying by this gives [-b.im, b.re].
-    // SAFETY: vld1q_f64 is safe to call here; NEON is mandatory on aarch64.
-    let sign: float64x2_t = unsafe {
-        let arr: [f64; 2] = [-1.0, 1.0];
-        vld1q_f64(arr.as_ptr())
-    };
-
-    // SAFETY: slice_a and slice_b are at least `len` elements long (asserted above);
+    // SAFETY: NEON is mandatory on aarch64 (guaranteed by #[target_feature]);
+    // slice_a and slice_b are at least `len` elements long (asserted above);
     // all pointer offsets stay within slice bounds.
     unsafe {
+        // Integer bitmask: flip sign bit of lane 0 only to negate b.im after rotation.
+        let arr: [u64; 2] = [0x8000000000000000, 0];
+        let sign_mask: uint64x2_t = vld1q_u64(arr.as_ptr());
+
         // ---- 4x main loop: 4 complex f64 per iteration ----
         let chunks_4 = len / 4;
         for i in 0..chunks_4 {
             let off = i * 8; // 4 complex * 2 f64/complex
 
+            // Interleaved a/b loads: improves pipelining on in-order CPUs.
             let a0 = vld1q_f64(a_ptr.add(off));
             let b0 = vld1q_f64(b_ptr.add(off));
             let a1 = vld1q_f64(a_ptr.add(off + 2));
@@ -72,29 +75,30 @@ pub(super) unsafe fn multiply_elements_neon(
             let a3 = vld1q_f64(a_ptr.add(off + 6));
             let b3 = vld1q_f64(b_ptr.add(off + 6));
 
-            // Broadcast real and imaginary parts of a.
-            let a_re0 = vdupq_laneq_f64::<0>(a0);
-            let a_im0 = vdupq_laneq_f64::<1>(a0);
-            let a_re1 = vdupq_laneq_f64::<0>(a1);
-            let a_im1 = vdupq_laneq_f64::<1>(a1);
-            let a_re2 = vdupq_laneq_f64::<0>(a2);
-            let a_im2 = vdupq_laneq_f64::<1>(a2);
-            let a_re3 = vdupq_laneq_f64::<0>(a3);
-            let a_im3 = vdupq_laneq_f64::<1>(a3);
+            // Rotate [b.re, b.im] → [b.im, b.re], then XOR-negate lane 0: [-b.im, b.re].
+            let b_sw0 = vreinterpretq_f64_u64(veorq_u64(
+                vreinterpretq_u64_f64(vextq_f64::<1>(b0, b0)),
+                sign_mask,
+            ));
+            let b_sw1 = vreinterpretq_f64_u64(veorq_u64(
+                vreinterpretq_u64_f64(vextq_f64::<1>(b1, b1)),
+                sign_mask,
+            ));
+            let b_sw2 = vreinterpretq_f64_u64(veorq_u64(
+                vreinterpretq_u64_f64(vextq_f64::<1>(b2, b2)),
+                sign_mask,
+            ));
+            let b_sw3 = vreinterpretq_f64_u64(veorq_u64(
+                vreinterpretq_u64_f64(vextq_f64::<1>(b3, b3)),
+                sign_mask,
+            ));
 
-            // Swap real/imag of b, then apply sign mask: [-b.im, b.re].
-            let b_sw0 = vmulq_f64(vextq_f64::<1>(b0, b0), sign);
-            let b_sw1 = vmulq_f64(vextq_f64::<1>(b1, b1), sign);
-            let b_sw2 = vmulq_f64(vextq_f64::<1>(b2, b2), sign);
-            let b_sw3 = vmulq_f64(vextq_f64::<1>(b3, b3), sign);
-
-            // result = a_re * b + a_im * b_sw_signed
-            //   [a.re*b.re + a.im*(-b.im), a.re*b.im + a.im*b.re]
-            //   = [a.re*b.re - a.im*b.im, a.re*b.im + a.im*b.re]
-            let r0 = vfmaq_f64(vmulq_f64(a_re0, b0), a_im0, b_sw0);
-            let r1 = vfmaq_f64(vmulq_f64(a_re1, b1), a_im1, b_sw1);
-            let r2 = vfmaq_f64(vmulq_f64(a_re2, b2), a_im2, b_sw2);
-            let r3 = vfmaq_f64(vmulq_f64(a_re3, b3), a_im3, b_sw3);
+            // Lane-indexed FMA: b * a[0] + b_sw * a[1]
+            //   = [b.re*a.re - b.im*a.im, b.im*a.re + b.re*a.im]
+            let r0 = vfmaq_laneq_f64::<1>(vmulq_laneq_f64::<0>(b0, a0), b_sw0, a0);
+            let r1 = vfmaq_laneq_f64::<1>(vmulq_laneq_f64::<0>(b1, a1), b_sw1, a1);
+            let r2 = vfmaq_laneq_f64::<1>(vmulq_laneq_f64::<0>(b2, a2), b_sw2, a2);
+            let r3 = vfmaq_laneq_f64::<1>(vmulq_laneq_f64::<0>(b3, a3), b_sw3, a3);
 
             vst1q_f64(r_ptr.add(off), r0);
             vst1q_f64(r_ptr.add(off + 2), r1);
@@ -108,12 +112,13 @@ pub(super) unsafe fn multiply_elements_neon(
             let off = (tail_start + j) * 2;
             let a0 = vld1q_f64(a_ptr.add(off));
             let b0 = vld1q_f64(b_ptr.add(off));
-            let a_re0 = vdupq_laneq_f64::<0>(a0);
-            let a_im0 = vdupq_laneq_f64::<1>(a0);
-            let b_sw0 = vmulq_f64(vextq_f64::<1>(b0, b0), sign);
+            let b_sw0 = vreinterpretq_f64_u64(veorq_u64(
+                vreinterpretq_u64_f64(vextq_f64::<1>(b0, b0)),
+                sign_mask,
+            ));
             vst1q_f64(
                 r_ptr.add(off),
-                vfmaq_f64(vmulq_f64(a_re0, b0), a_im0, b_sw0),
+                vfmaq_laneq_f64::<1>(vmulq_laneq_f64::<0>(b0, a0), b_sw0, a0),
             );
         }
         // No scalar tail: each NEON register handles exactly 1 Complex<f64>.
@@ -135,58 +140,62 @@ pub(super) unsafe fn multiply_add_elements_neon(
     let a_ptr = slice_a.as_ptr() as *const f64;
     let b_ptr = slice_b.as_ptr() as *const f64;
 
-    // SAFETY: vld1q_f64 is safe to call here; NEON is mandatory on aarch64.
-    let sign: float64x2_t = unsafe {
-        let arr: [f64; 2] = [-1.0, 1.0];
-        vld1q_f64(arr.as_ptr())
-    };
-
-    // SAFETY: slice_a and slice_b are at least `len` elements long (asserted above);
+    // SAFETY: NEON is mandatory on aarch64 (guaranteed by #[target_feature]);
+    // slice_a and slice_b are at least `len` elements long (asserted above);
     // all pointer offsets stay within slice bounds.
     unsafe {
+        // Integer bitmask: flip sign bit of lane 0 only to negate b.im after rotation.
+        let arr: [u64; 2] = [0x8000000000000000, 0];
+        let sign_mask: uint64x2_t = vld1q_u64(arr.as_ptr());
+
         // ---- 4x main loop: 4 complex f64 per iteration ----
         let chunks_4 = len / 4;
         for i in 0..chunks_4 {
             let off = i * 8;
+            let b0 = vld1q_f64(b_ptr.add(off));
+            let b1 = vld1q_f64(b_ptr.add(off + 2));
+            let b2 = vld1q_f64(b_ptr.add(off + 4));
+            let b3 = vld1q_f64(b_ptr.add(off + 6));
 
             let acc0 = vld1q_f64(r_ptr.add(off));
             let acc1 = vld1q_f64(r_ptr.add(off + 2));
             let acc2 = vld1q_f64(r_ptr.add(off + 4));
             let acc3 = vld1q_f64(r_ptr.add(off + 6));
 
+            // Rotate [b.re, b.im] → [b.im, b.re], then XOR-negate lane 0: [-b.im, b.re].
+            // Interleaved with a loads so both b_sw and a are ready before fmla.
+            let b_sw0 = vreinterpretq_f64_u64(veorq_u64(
+                vreinterpretq_u64_f64(vextq_f64::<1>(b0, b0)),
+                sign_mask,
+            ));
             let a0 = vld1q_f64(a_ptr.add(off));
-            let b0 = vld1q_f64(b_ptr.add(off));
+            let b_sw1 = vreinterpretq_f64_u64(veorq_u64(
+                vreinterpretq_u64_f64(vextq_f64::<1>(b1, b1)),
+                sign_mask,
+            ));
             let a1 = vld1q_f64(a_ptr.add(off + 2));
-            let b1 = vld1q_f64(b_ptr.add(off + 2));
+            let b_sw2 = vreinterpretq_f64_u64(veorq_u64(
+                vreinterpretq_u64_f64(vextq_f64::<1>(b2, b2)),
+                sign_mask,
+            ));
             let a2 = vld1q_f64(a_ptr.add(off + 4));
-            let b2 = vld1q_f64(b_ptr.add(off + 4));
+            let b_sw3 = vreinterpretq_f64_u64(veorq_u64(
+                vreinterpretq_u64_f64(vextq_f64::<1>(b3, b3)),
+                sign_mask,
+            ));
             let a3 = vld1q_f64(a_ptr.add(off + 6));
-            let b3 = vld1q_f64(b_ptr.add(off + 6));
 
-            let a_re0 = vdupq_laneq_f64::<0>(a0);
-            let a_im0 = vdupq_laneq_f64::<1>(a0);
-            let a_re1 = vdupq_laneq_f64::<0>(a1);
-            let a_im1 = vdupq_laneq_f64::<1>(a1);
-            let a_re2 = vdupq_laneq_f64::<0>(a2);
-            let a_im2 = vdupq_laneq_f64::<1>(a2);
-            let a_re3 = vdupq_laneq_f64::<0>(a3);
-            let a_im3 = vdupq_laneq_f64::<1>(a3);
+            // Chained lane-indexed FMA: acc + b*a.re + b_sw*a.im.
+            // vfmaq_laneq_f64(a, b, v) = a + b*v[N], so the argument order is (acc, b, a).
+            let r0 = vfmaq_laneq_f64::<1>(vfmaq_laneq_f64::<0>(acc0, b0, a0), b_sw0, a0);
+            let r1 = vfmaq_laneq_f64::<1>(vfmaq_laneq_f64::<0>(acc1, b1, a1), b_sw1, a1);
+            let r2 = vfmaq_laneq_f64::<1>(vfmaq_laneq_f64::<0>(acc2, b2, a2), b_sw2, a2);
+            let r3 = vfmaq_laneq_f64::<1>(vfmaq_laneq_f64::<0>(acc3, b3, a3), b_sw3, a3);
 
-            let b_sw0 = vmulq_f64(vextq_f64::<1>(b0, b0), sign);
-            let b_sw1 = vmulq_f64(vextq_f64::<1>(b1, b1), sign);
-            let b_sw2 = vmulq_f64(vextq_f64::<1>(b2, b2), sign);
-            let b_sw3 = vmulq_f64(vextq_f64::<1>(b3, b3), sign);
-
-            // Compute product a*b, then add accumulator.
-            let prod0 = vfmaq_f64(vmulq_f64(a_re0, b0), a_im0, b_sw0);
-            let prod1 = vfmaq_f64(vmulq_f64(a_re1, b1), a_im1, b_sw1);
-            let prod2 = vfmaq_f64(vmulq_f64(a_re2, b2), a_im2, b_sw2);
-            let prod3 = vfmaq_f64(vmulq_f64(a_re3, b3), a_im3, b_sw3);
-
-            vst1q_f64(r_ptr.add(off), vaddq_f64(acc0, prod0));
-            vst1q_f64(r_ptr.add(off + 2), vaddq_f64(acc1, prod1));
-            vst1q_f64(r_ptr.add(off + 4), vaddq_f64(acc2, prod2));
-            vst1q_f64(r_ptr.add(off + 6), vaddq_f64(acc3, prod3));
+            vst1q_f64(r_ptr.add(off), r0);
+            vst1q_f64(r_ptr.add(off + 2), r1);
+            vst1q_f64(r_ptr.add(off + 4), r2);
+            vst1q_f64(r_ptr.add(off + 6), r3);
         }
 
         // ---- 1x cleanup: 1 complex f64 per step ----
@@ -196,11 +205,12 @@ pub(super) unsafe fn multiply_add_elements_neon(
             let acc0 = vld1q_f64(r_ptr.add(off));
             let a0 = vld1q_f64(a_ptr.add(off));
             let b0 = vld1q_f64(b_ptr.add(off));
-            let a_re0 = vdupq_laneq_f64::<0>(a0);
-            let a_im0 = vdupq_laneq_f64::<1>(a0);
-            let b_sw0 = vmulq_f64(vextq_f64::<1>(b0, b0), sign);
-            let prod0 = vfmaq_f64(vmulq_f64(a_re0, b0), a_im0, b_sw0);
-            vst1q_f64(r_ptr.add(off), vaddq_f64(acc0, prod0));
+            let b_sw0 = vreinterpretq_f64_u64(veorq_u64(
+                vreinterpretq_u64_f64(vextq_f64::<1>(b0, b0)),
+                sign_mask,
+            ));
+            let r0 = vfmaq_laneq_f64::<1>(vfmaq_laneq_f64::<0>(acc0, b0, a0), b_sw0, a0);
+            vst1q_f64(r_ptr.add(off), r0);
         }
         // No scalar tail: each NEON register handles exactly 1 Complex<f64>.
     }
@@ -223,21 +233,20 @@ pub(super) unsafe fn multiply_elements_neon(
     let a_ptr = slice_a.as_ptr() as *const f32;
     let b_ptr = slice_b.as_ptr() as *const f32;
 
-    // Sign mask: [-1.0, 1.0, -1.0, 1.0] to negate the real cross-product lanes.
-    // SAFETY: vld1q_f32 is safe to call here; NEON is mandatory on aarch64.
-    let sign: float32x4_t = unsafe {
-        let arr: [f32; 4] = [-1.0, 1.0, -1.0, 1.0];
-        vld1q_f32(arr.as_ptr())
-    };
-
-    // SAFETY: slice_a and slice_b are at least `len` elements long (asserted above);
+    // SAFETY: NEON is mandatory on aarch64 (guaranteed by #[target_feature]);
+    // slice_a and slice_b are at least `len` elements long (asserted above);
     // all pointer offsets stay within slice bounds.
     unsafe {
+        // Integer bitmask: flip sign bit of even lanes (0 and 2) to negate b.im after vrev64.
+        let arr: [u32; 4] = [0x80000000, 0, 0x80000000, 0];
+        let sign_mask: uint32x4_t = vld1q_u32(arr.as_ptr());
+
         // ---- 4x main loop: 8 complex f32 per iteration ----
         let chunks_8 = len / 8;
         for i in 0..chunks_8 {
             let off = i * 16; // 8 complex * 2 f32/complex
 
+            // Interleaved a/b loads: improves pipelining on in-order CPUs.
             let a0 = vld1q_f32(a_ptr.add(off));
             let b0 = vld1q_f32(b_ptr.add(off));
             let a1 = vld1q_f32(a_ptr.add(off + 4));
@@ -253,11 +262,15 @@ pub(super) unsafe fn multiply_elements_neon(
             let (a_re2, a_im2) = (vtrn1q_f32(a2, a2), vtrn2q_f32(a2, a2));
             let (a_re3, a_im3) = (vtrn1q_f32(a3, a3), vtrn2q_f32(a3, a3));
 
-            // Swap pairs within 64-bit halves, then apply sign mask.
-            let b_sw0 = vmulq_f32(vrev64q_f32(b0), sign);
-            let b_sw1 = vmulq_f32(vrev64q_f32(b1), sign);
-            let b_sw2 = vmulq_f32(vrev64q_f32(b2), sign);
-            let b_sw3 = vmulq_f32(vrev64q_f32(b3), sign);
+            // Swap pairs within 64-bit halves, then XOR-negate even lanes: [-b.im, b.re, ...].
+            let b_sw0 =
+                vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(vrev64q_f32(b0)), sign_mask));
+            let b_sw1 =
+                vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(vrev64q_f32(b1)), sign_mask));
+            let b_sw2 =
+                vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(vrev64q_f32(b2)), sign_mask));
+            let b_sw3 =
+                vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(vrev64q_f32(b3)), sign_mask));
 
             let r0 = vfmaq_f32(vmulq_f32(a_re0, b0), a_im0, b_sw0);
             let r1 = vfmaq_f32(vmulq_f32(a_re1, b1), a_im1, b_sw1);
@@ -279,7 +292,9 @@ pub(super) unsafe fn multiply_elements_neon(
             let b0 = vld1q_f32(b_ptr.add(off));
             let a_re0 = vtrn1q_f32(a0, a0);
             let a_im0 = vtrn2q_f32(a0, a0);
-            let b_sw0 = vmulq_f32(vrev64q_f32(b0), sign);
+            // Swap pairs within 64-bit halves, then XOR-negate even lanes: [-b.im, b.re, ...].
+            let b_sw0 =
+                vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(vrev64q_f32(b0)), sign_mask));
             vst1q_f32(
                 r_ptr.add(off),
                 vfmaq_f32(vmulq_f32(a_re0, b0), a_im0, b_sw0),
@@ -309,31 +324,30 @@ pub(super) unsafe fn multiply_add_elements_neon(
     let a_ptr = slice_a.as_ptr() as *const f32;
     let b_ptr = slice_b.as_ptr() as *const f32;
 
-    // SAFETY: vld1q_f32 is safe to call here; NEON is mandatory on aarch64.
-    let sign: float32x4_t = unsafe {
-        let arr: [f32; 4] = [-1.0, 1.0, -1.0, 1.0];
-        vld1q_f32(arr.as_ptr())
-    };
-
-    // SAFETY: slice_a and slice_b are at least `len` elements long (asserted above);
+    // SAFETY: NEON is mandatory on aarch64 (guaranteed by #[target_feature]);
+    // slice_a and slice_b are at least `len` elements long (asserted above);
     // all pointer offsets stay within slice bounds.
     unsafe {
+        // Integer bitmask: flip sign bit of even lanes (0 and 2) to negate b.im after vrev64.
+        let arr: [u32; 4] = [0x80000000, 0, 0x80000000, 0];
+        let sign_mask: uint32x4_t = vld1q_u32(arr.as_ptr());
+
         // ---- 4x main loop: 8 complex f32 per iteration ----
         let chunks_8 = len / 8;
         for i in 0..chunks_8 {
             let off = i * 16;
 
+            // Interleaved acc/a/b loads: improves pipelining on in-order CPUs.
             let acc0 = vld1q_f32(r_ptr.add(off));
-            let acc1 = vld1q_f32(r_ptr.add(off + 4));
-            let acc2 = vld1q_f32(r_ptr.add(off + 8));
-            let acc3 = vld1q_f32(r_ptr.add(off + 12));
-
             let a0 = vld1q_f32(a_ptr.add(off));
             let b0 = vld1q_f32(b_ptr.add(off));
+            let acc1 = vld1q_f32(r_ptr.add(off + 4));
             let a1 = vld1q_f32(a_ptr.add(off + 4));
             let b1 = vld1q_f32(b_ptr.add(off + 4));
+            let acc2 = vld1q_f32(r_ptr.add(off + 8));
             let a2 = vld1q_f32(a_ptr.add(off + 8));
             let b2 = vld1q_f32(b_ptr.add(off + 8));
+            let acc3 = vld1q_f32(r_ptr.add(off + 12));
             let a3 = vld1q_f32(a_ptr.add(off + 12));
             let b3 = vld1q_f32(b_ptr.add(off + 12));
 
@@ -342,21 +356,26 @@ pub(super) unsafe fn multiply_add_elements_neon(
             let (a_re2, a_im2) = (vtrn1q_f32(a2, a2), vtrn2q_f32(a2, a2));
             let (a_re3, a_im3) = (vtrn1q_f32(a3, a3), vtrn2q_f32(a3, a3));
 
-            let b_sw0 = vmulq_f32(vrev64q_f32(b0), sign);
-            let b_sw1 = vmulq_f32(vrev64q_f32(b1), sign);
-            let b_sw2 = vmulq_f32(vrev64q_f32(b2), sign);
-            let b_sw3 = vmulq_f32(vrev64q_f32(b3), sign);
+            // Swap pairs within 64-bit halves, then XOR-negate even lanes: [-b.im, b.re, ...].
+            let b_sw0 =
+                vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(vrev64q_f32(b0)), sign_mask));
+            let b_sw1 =
+                vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(vrev64q_f32(b1)), sign_mask));
+            let b_sw2 =
+                vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(vrev64q_f32(b2)), sign_mask));
+            let b_sw3 =
+                vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(vrev64q_f32(b3)), sign_mask));
 
-            // Compute product a*b, then add accumulator.
-            let prod0 = vfmaq_f32(vmulq_f32(a_re0, b0), a_im0, b_sw0);
-            let prod1 = vfmaq_f32(vmulq_f32(a_re1, b1), a_im1, b_sw1);
-            let prod2 = vfmaq_f32(vmulq_f32(a_re2, b2), a_im2, b_sw2);
-            let prod3 = vfmaq_f32(vmulq_f32(a_re3, b3), a_im3, b_sw3);
+            // Compute a*b + accumulator using chained FMA.
+            let r0 = vfmaq_f32(vfmaq_f32(acc0, a_re0, b0), a_im0, b_sw0);
+            let r1 = vfmaq_f32(vfmaq_f32(acc1, a_re1, b1), a_im1, b_sw1);
+            let r2 = vfmaq_f32(vfmaq_f32(acc2, a_re2, b2), a_im2, b_sw2);
+            let r3 = vfmaq_f32(vfmaq_f32(acc3, a_re3, b3), a_im3, b_sw3);
 
-            vst1q_f32(r_ptr.add(off), vaddq_f32(acc0, prod0));
-            vst1q_f32(r_ptr.add(off + 4), vaddq_f32(acc1, prod1));
-            vst1q_f32(r_ptr.add(off + 8), vaddq_f32(acc2, prod2));
-            vst1q_f32(r_ptr.add(off + 12), vaddq_f32(acc3, prod3));
+            vst1q_f32(r_ptr.add(off), r0);
+            vst1q_f32(r_ptr.add(off + 4), r1);
+            vst1q_f32(r_ptr.add(off + 8), r2);
+            vst1q_f32(r_ptr.add(off + 12), r3);
         }
 
         // ---- 1x cleanup: 2 complex f32 per step ----
@@ -369,9 +388,11 @@ pub(super) unsafe fn multiply_add_elements_neon(
             let b0 = vld1q_f32(b_ptr.add(off));
             let a_re0 = vtrn1q_f32(a0, a0);
             let a_im0 = vtrn2q_f32(a0, a0);
-            let b_sw0 = vmulq_f32(vrev64q_f32(b0), sign);
-            let prod0 = vfmaq_f32(vmulq_f32(a_re0, b0), a_im0, b_sw0);
-            vst1q_f32(r_ptr.add(off), vaddq_f32(acc0, prod0));
+            // Swap pairs within 64-bit halves, then XOR-negate even lanes: [-b.im, b.re, ...].
+            let b_sw0 =
+                vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(vrev64q_f32(b0)), sign_mask));
+            let r0 = vfmaq_f32(vfmaq_f32(acc0, a_re0, b0), a_im0, b_sw0);
+            vst1q_f32(r_ptr.add(off), r0);
         }
 
         // ---- Scalar tail: 0-1 remaining Complex<f32> ----
